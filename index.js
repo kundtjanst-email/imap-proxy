@@ -144,7 +144,7 @@ app.post('/api/:action', async (req, res) => {
     }
 
     if (action === "send") {
-      const { to, subject, body, inReplyTo } = params;
+      const { to, subject, body, inReplyTo, attachments } = params;
       if (!to || !subject) {
         return res.status(400).json({ error: "to and subject are required" });
       }
@@ -156,8 +156,18 @@ app.post('/api/:action', async (req, res) => {
       );
       const mailOptions = {
         from: display_name ? `"${display_name}" <${email}>` : email,
-        to, subject, text: body,
+        to,
+        subject,
+        text: body,
       };
+      if (attachments && attachments.length > 0) {
+        mailOptions.attachments = attachments.map(att => ({
+          filename: att.filename,
+          content: att.base64,
+          encoding: 'base64',
+          contentType: att.mimeType,
+        }));
+      }
       if (inReplyTo) {
         mailOptions.inReplyTo = inReplyTo;
         mailOptions.references = inReplyTo;

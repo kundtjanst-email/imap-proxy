@@ -297,6 +297,6 @@ app.post('/api/:action', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`IMAP Proxy running on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`IMAP Proxy running on 0.0.0.0:${PORT}`);
 });

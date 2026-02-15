@@ -7,7 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 
 const PROXY_SECRET = process.env.PROXY_SECRET;
 function authMiddleware(req, res, next) {
@@ -119,6 +119,54 @@ function extractBodyFromSource(raw) {
   return htmlBody || textBody || "";
 }
 
+function extractAttachmentsFromSource(raw) {
+  const attachments = [];
+  const boundaryMatch = raw.match(/boundary="?([^";\r\n]+)"?/i);
+  if (!boundaryMatch) return attachments;
+  const boundary = boundaryMatch[1].trim();
+  const parts = raw.split("--" + boundary);
+  for (const part of parts) {
+    if (part.startsWith("--") || !part.trim()) continue;
+    const partHeaderEnd = part.indexOf("\r\n\r\n");
+    if (partHeaderEnd === -1) continue;
+    const partHeadersRaw = part.substring(0, partHeaderEnd);
+    const partHeaders = partHeadersRaw.toLowerCase();
+    const partContent = part.substring(partHeaderEnd + 4).replace(/--$/, "").trim();
+    const nestedBoundaryMatch = partHeaders.match(/boundary="?([^";\r\n]+)"?/i);
+    if (nestedBoundaryMatch) {
+      const nested = extractAttachmentsFromSource(part.substring(partHeaderEnd + 4));
+      attachments.push(...nested);
+      continue;
+    }
+    const isAttachment = partHeaders.includes("content-disposition: attachment") ||
+      (partHeaders.includes("filename=") && !partHeaders.includes("text/plain") && !partHeaders.includes("text/html"));
+    const isInlineWithFilename = partHeaders.includes("content-disposition: inline") && partHeaders.includes("filename=");
+    if (isAttachment || isInlineWithFilename) {
+      const filenameMatch = partHeadersRaw.match(/filename="?([^";\r\n]+)"?/i);
+      const filename = filenameMatch ? filenameMatch[1].trim() : "attachment";
+      const ctMatch = partHeadersRaw.match(/Content-Type:\s*([^;\r\n]+)/i);
+      const mimeType = ctMatch ? ctMatch[1].trim() : "application/octet-stream";
+      const encMatch = partHeaders.match(/content-transfer-encoding:\s*(\S+)/);
+      const encoding = encMatch ? encMatch[1].trim().toLowerCase() : "";
+      let base64Data = "";
+      if (encoding === "base64") {
+        base64Data = partContent.replace(/\s/g, "");
+      } else {
+        base64Data = Buffer.from(partContent, "binary").toString("base64");
+      }
+      if (base64Data) {
+        attachments.push({
+          filename,
+          mimeType,
+          size: Math.ceil(base64Data.length * 3 / 4),
+          base64: base64Data,
+        });
+      }
+    }
+  }
+  return attachments;
+}
+
 function createImapClient(host, port, username, password, useSsl) {
   return new ImapFlow({
     host,
@@ -138,13 +186,11 @@ app.post('/api/:action', async (req, res) => {
       email, display_name, use_ssl,
       ...params
     } = req.body;
-
     if (!imap_host || !imap_username || !imap_password) {
       return res.status(400).json({ error: "Missing IMAP credentials" });
     }
-
     if (action === "send") {
-      const { to, subject, body, inReplyTo, attachments } = params;
+      const { to, subject, body, inReplyTo } = params;
       if (!to || !subject) {
         return res.status(400).json({ error: "to and subject are required" });
       }
@@ -156,35 +202,50 @@ app.post('/api/:action', async (req, res) => {
       );
       const mailOptions = {
         from: display_name ? `"${display_name}" <${email}>` : email,
-        to,
-        subject,
-        text: body,
+        to, subject, text: body,
       };
-      if (attachments && attachments.length > 0) {
-        mailOptions.attachments = attachments.map(att => ({
+      if (inReplyTo) {
+        mailOptions.inReplyTo = inReplyTo;
+        mailOptions.references = inReplyTo;
+      }
+      if (params.attachments && params.attachments.length > 0) {
+        mailOptions.attachments = params.attachments.map(att => ({
           filename: att.filename,
           content: att.base64,
           encoding: 'base64',
           contentType: att.mimeType,
         }));
       }
-      if (inReplyTo) {
-        mailOptions.inReplyTo = inReplyTo;
-        mailOptions.references = inReplyTo;
-      }
       const info = await transporter.sendMail(mailOptions);
       return res.json({ success: true, id: info.messageId });
     }
-
     if (action === "list") {
       const maxResults = params.maxResults || 20;
+      const beforeDate = params.beforeDate;
+      const searchQuery = params.searchQuery;
       const client = createImapClient(imap_host, imap_port, imap_username, imap_password, use_ssl);
       await client.connect();
       try {
         const lock = await client.getMailboxLock("INBOX");
         try {
+          let searchCriteria = { all: true };
+          const searchParts = [];
+          if (beforeDate) {
+            const d = typeof beforeDate === 'number'
+              ? new Date(beforeDate * 1000)
+              : new Date(beforeDate);
+            if (!isNaN(d.getTime())) {
+              searchParts.push({ before: d });
+            }
+          }
+          if (searchQuery && searchQuery.trim()) {
+            searchParts.push({ text: searchQuery.trim() });
+          }
+          if (searchParts.length > 0) {
+            searchCriteria = searchParts.length === 1 ? searchParts[0] : { and: searchParts };
+          }
           const msgs = [];
-          for await (const msg of client.fetch({ all: true }, {
+          for await (const msg of client.fetch(searchCriteria, {
             envelope: true, uid: true, flags: true, bodyStructure: true,
             source: { start: 0, maxLength: 4096 },
           })) {
@@ -208,7 +269,6 @@ app.post('/api/:action', async (req, res) => {
         } finally { lock.release(); }
       } finally { await client.logout(); }
     }
-
     if (action === "get") {
       const { messageId } = params;
       if (!messageId) return res.status(400).json({ error: "messageId is required" });
@@ -222,18 +282,23 @@ app.post('/api/:action', async (req, res) => {
           }, { uid: true });
           const env = msg.envelope;
           let body = "";
-          if (msg.source) body = extractBodyFromSource(msg.source.toString());
+          let attachments = [];
+          if (msg.source) {
+            const rawSource = msg.source.toString();
+            body = extractBodyFromSource(rawSource);
+            attachments = extractAttachmentsFromSource(rawSource);
+          }
           return res.json({
             id: String(msg.uid), threadId: env.messageId || String(msg.uid),
             from: parseAddress(env.from), to: parseAddressList(env.to),
             subject: env.subject || "",
             date: env.date ? env.date.toISOString() : new Date().toISOString(),
             body, labelIds: [],
+            attachments,
           });
         } finally { lock.release(); }
       } finally { await client.logout(); }
     }
-
     if (action === "markRead") {
       const { messageId } = params;
       if (!messageId) return res.status(400).json({ error: "messageId is required" });
@@ -247,7 +312,6 @@ app.post('/api/:action', async (req, res) => {
         } finally { lock.release(); }
       } finally { await client.logout(); }
     }
-
     if (action === "markUnread") {
       const { messageId } = params;
       if (!messageId) return res.status(400).json({ error: "messageId is required" });
@@ -261,7 +325,6 @@ app.post('/api/:action', async (req, res) => {
         } finally { lock.release(); }
       } finally { await client.logout(); }
     }
-
     if (action === "listLabels") {
       const client = createImapClient(imap_host, imap_port, imap_username, imap_password, use_ssl);
       await client.connect();
@@ -271,7 +334,6 @@ app.post('/api/:action', async (req, res) => {
         return res.json({ labels });
       } finally { await client.logout(); }
     }
-
     if (action === "modifyLabels") {
       const { messageId, addLabelIds } = params;
       if (!messageId) return res.status(400).json({ error: "messageId is required" });
@@ -288,7 +350,6 @@ app.post('/api/:action', async (req, res) => {
       }
       return res.json({ success: true });
     }
-
     return res.status(400).json({ error: "Unknown action" });
   } catch (error) {
     const msg = error instanceof Error ? error.message : "Unknown error";
